@@ -1,0 +1,2 @@
+cppf_mysql_total_ts_nrows,f_MySQLCost,f_count_all_base_tables,f_count_ref_index_ts,f_BaseTableSumNrows,f_are_all_ts_index_ref,cpptable_count,has_having,has_group_by,has_rollup,has_order_by,has_limit,has_join,has_subquery,has_aggregation,select_list_size,where_condition_count,estimated_rows,IS_OLAP
+3024,9.754116624094204,1,3,19215,1,3,0,0,0,0,1,1,1,0,6,5,1107,0
