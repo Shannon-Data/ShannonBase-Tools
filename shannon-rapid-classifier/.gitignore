@@ -1,3 +1,6 @@
 __pycache__/
 *.pkl
 *.onnx
+# The shipped classifier is tracked: it is the artifact copied into
+# ShannonBase extra/llm-models/.
+!shannon_rapid_classifier.onnx
