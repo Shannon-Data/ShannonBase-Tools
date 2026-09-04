@@ -175,3 +175,62 @@ including the `OLAP_FACTOR` reduction applied when
 
 Keep the export at opset `ai.onnx 9` / `ai.onnx.ml 1` so the model loads on the
 ONNX Runtime the server links (`ONNXRUNTIME_VERSION` in `cmake/FindONNXRuntime.cmake`).
+
+## Real-workload validation
+
+Synthetic accuracy is not evidence on its own — it only counts if the server
+really produces those feature vectors. The model was validated against a live
+ShannonBase instance (`8.4.8-debug`, `tpch_sf1`) by setting
+`log_error_verbosity=3`, which un-gates the `[Note]` output of
+`Query_arbitrator::log_decision()`, and running `EXPLAIN` on each query so the
+pre-prepare hook fires without executing anything.
+
+Result: **11 / 11 correct** on the decisions the model was actually asked to
+make.
+
+| query | f_MySQLCost | f_BaseTableSumNrows | all_idx_ref | score | decision |
+| --- | ---: | ---: | :---: | ---: | --- |
+| TPC-H Q1 (scan + GROUP BY) | 2.65e6 | 5.99e6 | no | 0.9999 | TO_SECONDARY |
+| TPC-H Q6 (scan + SUM) | 6.55e5 | 5.99e6 | no | 0.9975 | TO_SECONDARY |
+| TPC-H Q3 (3-way + GROUP BY) | 2.01e6 | 7.64e6 | no | 1.0000 | TO_SECONDARY |
+| TPC-H Q5 (6-way + GROUP BY) | 3.19e6 | 7.65e6 | no | 0.9999 | TO_SECONDARY |
+| TPC-H Q10 (4-way top-N) | 4.45e6 | 7.64e6 | no | 0.9999 | TO_SECONDARY |
+| wide ETL scan, no aggregation | 6.55e5 | 5.99e6 | no | 0.9179 | TO_SECONDARY |
+| GROUP BY … WITH ROLLUP | 6.65e6 | 5.99e6 | no | 0.9995 | TO_SECONDARY |
+| indexed range + ORDER BY + LIMIT | 5.84 | 1.50e6 | yes | 0.0001 | TO_PRIMARY |
+| PK-equality 2-way join | 0.099 | 1.50e5 | no | 0.0002 | TO_PRIMARY |
+| NATION ⋈ REGION (30 rows) | 26.0 | 30 | no | 0.0000 | TO_PRIMARY |
+
+Three further point lookups (`WHERE pk = const`) never reach the model at all:
+`SecondaryEnginePrePrepareHook()` routes them to
+`standard_cost_threshold_classifier()` via the `is_very_fast_query()`
+short-circuit, and the optimizer trace confirms
+`"cost: 1.000000, threshold: 100000.000000" -> primary`. That is by design — the
+model is only consulted where the answer is not already obvious.
+
+### What the live run changed in this dataset
+
+Checking each real feature vector against the training ranges found two regions
+the generator was not covering, both at the small end:
+
+* `f_MySQLCost = 0.099` for the PK-equality join — **below** the old minimum of
+  1.1. The optimizer folds such plans to const tables and reports a fraction of
+  a cost unit, which the cost formula could never produce.
+* `f_BaseTableSumNrows = 30` for NATION ⋈ REGION — **below** the old minimum of
+  56.
+
+Two archetypes were added to cover them (`const_join`, `tiny_dim_join`), the
+small-table floor was lowered, and `_synthesise_primary_cost()` gained a
+const-plan branch. Effect:
+
+| | before | after |
+| --- | --- | --- |
+| held-out accuracy | 0.940 | **0.958** |
+| held-out AUC | 0.988 | **0.994** |
+| golden set | 22/22 | 22/22 |
+| real workload | 11/11 | 11/11 |
+| wide ETL scan margin | 0.533 (borderline) | **0.918** |
+
+This is the loop worth repeating when the model is retrained: run the workload,
+diff the logged feature vectors against the training ranges, and add coverage
+wherever production lands outside them.

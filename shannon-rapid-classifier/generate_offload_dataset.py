@@ -140,6 +140,8 @@ class QueryShape:
     out_rows: float = 1.0
     group_cardinality: float = 1.0
     rapid_prune: float = 1.0          # zone-map pruning factor in (0, 1]
+    const_plan: bool = False          # plan folded to const tables (cost << 1)
+    const_cost: float = 0.1
 
     @property
     def has_where(self) -> bool:
@@ -172,6 +174,10 @@ def _accumulate_subquery_cost(blocks: List[SubBlock]):
 
 def _synthesise_primary_cost(shape: QueryShape) -> float:
     """What Secondary_engine_statement_context::get_primary_cost() would hold."""
+    if shape.const_plan:
+        # A plan folded to const/eq_ref tables costs a fraction of a unit;
+        # tpch_sf1 measured 0.099 for a two-table PK-equality join.
+        return shape.const_cost
     cost = shape.innodb_scan_rows * (
         MYSQL_ROW_EVAL + MYSQL_BLOCK_READ / MYSQL_ROWS_PER_BLOCK
     )
@@ -180,7 +186,7 @@ def _synthesise_primary_cost(shape: QueryShape) -> float:
         cost += shape.innodb_scan_rows * MYSQL_ROW_EVAL * 0.5
     if shape.has_order_by:
         cost += shape.out_rows * MYSQL_ROW_EVAL
-    return max(cost, 0.35)
+    return max(cost, 0.05)
 
 
 def derive_features(shape: QueryShape, have_primary_plan: bool) -> dict:
@@ -564,6 +570,51 @@ def a_mixed_join(rng):
     )
 
 
+def a_const_join(rng):
+    """PK-equality lookup that the optimizer folds into const tables: the cost
+    the primary reports is a fraction of a unit, far below anything the cost
+    formula above produces.  Observed on tpch_sf1 as f_MySQLCost=0.099."""
+    k = rng.randint(1, 3)
+    tables = [TableRef(rows=_logu(rng, 1e3, 5e8), index_reached=rng.random() < 0.5)
+              for _ in range(k)]
+    return QueryShape(
+        kind="const_join",
+        tables=tables,
+        select_list_size=rng.randint(1, 20),
+        where_condition_count=rng.randint(1, 4),
+        has_order_by=rng.random() < 0.3,
+        limit_value=rng.choice([None, 1.0, 10.0]),
+        innodb_index_lookups=rng.randint(1, 4),
+        out_rows=rng.randint(1, 5),
+        const_plan=True, const_cost=rng.uniform(0.05, 2.5),
+        rapid_prune=rng.uniform(0.05, 0.5),
+    )
+
+
+def a_tiny_dim_join(rng):
+    """A join of lookup/dimension tables of a few dozen rows -- tpch NATION and
+    REGION are 25 and 5.  Everything is scanned, so are_all_ts_index_ref is 0,
+    but the whole query is cheaper than the offload handshake."""
+    k = rng.randint(1, 4)
+    tables = [TableRef(rows=_logu(rng, 2, 2e3), index_reached=rng.random() < 0.3)
+              for _ in range(k)]
+    total = sum(t.rows for t in tables)
+    grp = rng.random() < 0.4
+    return QueryShape(
+        kind="tiny_dim_join",
+        tables=tables,
+        select_list_size=rng.randint(1, 12),
+        where_condition_count=rng.randint(0, 3),
+        has_group_by=grp,
+        has_having=grp and rng.random() < 0.3,
+        has_order_by=rng.random() < 0.6,
+        limit_value=rng.choice([None, 10.0, 100.0]),
+        innodb_scan_rows=total,
+        out_rows=max(1.0, total * rng.uniform(0.05, 1.0)),
+        rapid_prune=rng.uniform(0.7, 1.0),
+    )
+
+
 ARCHETYPES = [
     # (sampler, weight)
     (a_point_lookup, 8),
@@ -579,6 +630,8 @@ ARCHETYPES = [
     (a_small_table_report, 8),
     (a_medium_scan, 9),
     (a_mixed_join, 10),
+    (a_const_join, 7),
+    (a_tiny_dim_join, 6),
 ]
 
 
