@@ -188,7 +188,6 @@ def _synthesise_primary_cost(shape: QueryShape) -> float:
         cost += shape.out_rows * MYSQL_ROW_EVAL
     return max(cost, 0.05)
 
-
 def derive_features(shape: QueryShape, have_primary_plan: bool) -> dict:
     f = {}
 
