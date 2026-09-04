@@ -124,3 +124,54 @@ The CSV column order is authoritative and must stay identical to
 `features_to_vector()` indices 0..17. `train_offload_classifier.py` preserves it
 via `df.drop(columns=["IS_OLAP"])`, and the ONNX model consumes a bare tensor
 with no column names, so a reordering here silently corrupts every prediction.
+
+## Building shannon_rapid_classifier.onnx
+
+`build_classifier_model.py` does train -> export -> verify in one step:
+
+```
+python build_classifier_model.py
+cp shannon_rapid_classifier.onnx <shannonbase>/extra/llm-models/
+```
+
+### The output contract (important)
+
+`Query_arbitrator::load_model()` binds **output index 0 and nothing else**:
+
+```cpp
+auto output_name_ptr = m_session->GetOutputNameAllocated(0, allocator);
+```
+
+and `predict_with_features()` reads that tensor as `float`:
+
+```cpp
+float *output_data = output_tensors[0].GetTensorMutableData<float>();
+if (shape.size() >= 2 && shape[1] == 2) prediction_score = output_data[1];
+else                                    prediction_score = output_data[0];
+```
+
+A stock `convert_lightgbm()` export puts `label` (int64, shape `[1]`) at output
+index 0 and hides the probabilities behind a `ZipMap`, which is a sequence of
+maps rather than a tensor. Loaded that way the int64 label is reinterpreted as
+a float: label 0 reads as `0.0` and label 1 reads as the denormal `1.4e-45`, so
+`prediction_score > threshold` is **never** true and the arbitrator returns
+`TO_PRIMARY` for every query no matter what the model predicts.
+
+`build_classifier_model.py` therefore exports with `zipmap=False` and reorders
+the graph outputs so the float `[N, 2]` probability tensor sits at index 0. That
+lands on the `shape[1] == 2` branch, where `output_data[1]` is
+P(offload to Rapid). No C++ change is required, and the script asserts the
+contract rather than trusting it:
+
+* exactly one input, `[None, 18]`
+* `output[0]` is `tensor(float)` with shape `[None, 2]`
+* ONNX probabilities match `LGBMClassifier.predict_proba` to < 1e-5 with zero
+  decision disagreements over the whole dataset
+* a batch-of-1 run returns shape `(1, 2)`, the shape the server actually uses
+
+It finishes by scoring the golden set through the server's *effective* threshold,
+including the `OLAP_FACTOR` reduction applied when
+`has_group_by + has_having + has_aggregation + has_order_by + has_subquery >= 4`.
+
+Keep the export at opset `ai.onnx 9` / `ai.onnx.ml 1` so the model loads on the
+ONNX Runtime the server links (`ONNXRUNTIME_VERSION` in `cmake/FindONNXRuntime.cmake`).
